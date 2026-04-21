@@ -1,184 +1,411 @@
 `timescale 1ns/1ps
 
-module tb_magma_gost3412_2018;
+// ============================================================
+// MAGMA TestBench
+// Reference: GOST 34.12-2018, Appendix A, Section A.3
+// ============================================================
 
-    // ====================== DUT интерфейс ======================
+module magma_tb;
+
+    // =========================================================
+    // DUT Signals
+    // =========================================================
     logic         decrypt;
     logic [63:0]  block_in;
     logic [255:0] key;
     logic [63:0]  block_out;
 
-    magma dut (.*);
+    // =========================================================
+    // Test Counters
+    // =========================================================
+    int total_tests;
+    int passed_tests;
+    int failed_tests;
 
-    int error_count = 0;
+    // =========================================================
+    // DUT Instance
+    // =========================================================
+    magma dut (
+        .decrypt   (decrypt),
+        .block_in  (block_in),
+        .key       (key),
+        .block_out (block_out)
+    );
 
-    // ============================================================
-    // S-BOX из вашего DUT (и ГОСТ 34.12-2018 / 2015 для Магмы)
-    // ============================================================
-    localparam logic [3:0] PI [0:7][0:15] = '{
-        '{12,4,6,2,10,5,11,9,14,8,13,7,0,3,15,1},
-        '{6,8,2,3,9,10,5,12,1,14,4,7,11,13,0,15},
-        '{11,3,5,8,2,15,10,13,14,1,7,4,12,9,6,0},
-        '{12,8,2,1,13,4,15,6,7,0,10,5,3,14,9,11},
-        '{7,15,5,10,8,1,6,13,0,9,3,14,11,4,2,12},
-        '{5,13,15,6,9,2,12,10,11,7,8,1,4,3,14,0},
-        '{8,14,2,5,6,9,1,12,15,4,11,0,13,10,3,7},
-        '{1,7,14,13,0,5,8,3,4,15,10,6,9,12,11,2}
-    };
+    // =========================================================
+    // Helper Task: Apply vector and verify result
+    //
+    // Parameters:
+    //   test_name   - test description string
+    //   dec         - mode (0=encrypt, 1=decrypt)
+    //   blk_in      - input block 64 bit
+    //   k           - key 256 bit
+    //   expected    - expected result 64 bit
+    // =========================================================
+    task automatic run_test(
+        input string    test_name,
+        input logic     dec,
+        input logic [63:0]  blk_in,
+        input logic [255:0] k,
+        input logic [63:0]  expected
+    );
+        logic [63:0] result;
 
-    // ====================== format helpers ======================
-    function automatic string hex64(input logic [63:0] x);
-        return $sformatf("%016h", x);
-    endfunction
-    function automatic string hex32(input logic [31:0] x);
-        return $sformatf("%08h", x);
-    endfunction
+        decrypt  = dec;
+        block_in = blk_in;
+        key      = k;
 
-    task automatic check_eq64(input string name, input logic [63:0] got, input logic [63:0] exp);
-        if (got === exp) $display("[PASS] %-30s %s", name, hex64(got));
-        else begin
-            $display("[FAIL] %-30s got=%s exp=%s", name, hex64(got), hex64(exp));
-            error_count++;
+        #10;
+
+        result = block_out;
+        total_tests++;
+
+        if (result === expected) begin
+            $display("[PASS] %s", test_name);
+            $display("       block_in  = 0x%016h", blk_in);
+            $display("       key       = 0x%064h", k);
+            $display("       expected  = 0x%016h", expected);
+            $display("       got       = 0x%016h", result);
+            passed_tests++;
+        end else begin
+            $display("[FAIL] %s", test_name);
+            $display("       block_in  = 0x%016h", blk_in);
+            $display("       key       = 0x%064h", k);
+            $display("       expected  = 0x%016h", expected);
+            $display("       got       = 0x%016h", result);
+            $display("       DIFF      = 0x%016h", result ^ expected);
+            failed_tests++;
         end
+        $display("");
+
     endtask
 
-    task automatic check_eq32(input string name, input logic [31:0] got, input logic [31:0] exp);
-        if (got === exp) $display("[PASS] %-30s %s", name, hex32(got));
-        else begin
-            $display("[FAIL] %-30s got=%s exp=%s", name, hex32(got), hex32(exp));
-            error_count++;
-        end
-    endtask
+    // =========================================================
+    // Helper Task: Verify reversibility
+    // Encrypt then decrypt - should recover original plaintext
+    // =========================================================
+    task automatic run_roundtrip_test(
+        input string    test_name,
+        input logic [63:0]  plaintext,
+        input logic [255:0] k
+    );
+        logic [63:0] ciphertext;
+        logic [63:0] decrypted;
 
-    // ============================================================
-    // Эталонные t и g (ГОСТ 34.12-2018, A.3.1 / A.3.2)
-    // t(a): подстановка π0..π7 над нибблами a0..a7 (справа налево)
-    // g[k](a) = ( t(a + k mod 2^32) ) <<< 11
-    // ============================================================
-    function automatic logic [31:0] t_ref(input logic [31:0] a);
-        logic [31:0] y;
-        begin
-            y = '0;
-            for (int i = 0; i < 8; i++)
-                y[i*4 +: 4] = PI[i][ a[i*4 +: 4] ];
-            t_ref = y;
-        end
-    endfunction
-
-    function automatic logic [31:0] g_ref(input logic [31:0] a, input logic [31:0] k);
-        logic [31:0] s, t;
-        begin
-            s = a + k;
-            t = t_ref(s);
-            g_ref = {t[20:0], t[31:21]}; // ROTL 11
-        end
-    endfunction
-
-    // ============================================================
-    // Эталонный key schedule (ГОСТ 34.12-2018, (18), A.3.3)
-    // ============================================================
-    function automatic logic [31:0] rk_ref(input logic [255:0] K, input int idx_1based);
-        logic [31:0] base[1:8];
-        begin
-            for (int i = 1; i <= 8; i++)
-                base[i] = K[255 - (i-1)*32 -: 32];
-
-            if (idx_1based >= 1 && idx_1based <= 24)
-                rk_ref = base[((idx_1based-1) % 8) + 1];
-            else if (idx_1based >= 25 && idx_1based <= 32)
-                rk_ref = base[8 - (idx_1based-25)];
-            else
-                rk_ref = 32'hx;
-        end
-    endfunction
-
-    // ====================== DUT call wrappers ======================
-    task automatic dut_encrypt(input logic [63:0] pt, input logic [255:0] k, output logic [63:0] ct);
+        // Step 1: Encrypt
         decrypt  = 1'b0;
-        block_in = pt;
+        block_in = plaintext;
         key      = k;
-        #20;
-        ct = block_out;
-    endtask
+        #10;
+        ciphertext = block_out;
 
-    task automatic dut_decrypt(input logic [63:0] ct, input logic [255:0] k, output logic [63:0] pt);
+        // Step 2: Decrypt
         decrypt  = 1'b1;
-        block_in = ct;
+        block_in = ciphertext;
         key      = k;
-        #20;
-        pt = block_out;
+        #10;
+        decrypted = block_out;
+
+        total_tests++;
+        if (decrypted === plaintext) begin
+            $display("[PASS] ROUNDTRIP: %s", test_name);
+            $display("       plaintext  = 0x%016h", plaintext);
+            $display("       ciphertext = 0x%016h", ciphertext);
+            $display("       decrypted  = 0x%016h", decrypted);
+            passed_tests++;
+        end else begin
+            $display("[FAIL] ROUNDTRIP: %s", test_name);
+            $display("       plaintext  = 0x%016h", plaintext);
+            $display("       ciphertext = 0x%016h", ciphertext);
+            $display("       decrypted  = 0x%016h", decrypted);
+            $display("       DIFF       = 0x%016h", decrypted ^ plaintext);
+            failed_tests++;
+        end
+        $display("");
+
     endtask
 
-    // ====================== MAIN ======================
+    // =========================================================
+    // Main Test Block
+    // =========================================================
     initial begin
-        logic [255:0] K;
-        logic [63:0]  PT, CT;
-        logic [63:0]  got_ct, got_pt;
 
-        $display("\n======================================================");
-        $display("   Magma TB (aligned with GOST 34.12-2018, Appendix A.3)");
-        $display("======================================================\n");
+        total_tests  = 0;
+        passed_tests = 0;
+        failed_tests = 0;
 
-        // ГОСТ A.3.3 ключ
-        K  = 256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff;
+        decrypt  = 1'b0;
+        block_in = 64'h0;
+        key      = 256'h0;
 
-        // ------------------------------------------------------------
-        // A.3.1: t-преобразование
-        // ------------------------------------------------------------
-        $display("[A.3.1] t() checks");
-        check_eq32("t(fdb97531)", t_ref(32'hfdb97531), 32'h2a196f34);
-        check_eq32("t(2a196f34)", t_ref(32'h2a196f34), 32'hebd9f03a);
-        check_eq32("t(ebd9f03a)", t_ref(32'hebd9f03a), 32'hb039bb3d);
-        check_eq32("t(b039bb3d)", t_ref(32'hb039bb3d), 32'h68695433);
+        $display("=========================================================");
+        $display("  MAGMA TestBench - GOST 34.12-2018 (Appendix A, A.3)");
+        $display("=========================================================");
+        $display("");
 
-        // ------------------------------------------------------------
-        // A.3.2: g-преобразование
-        // ------------------------------------------------------------
-        $display("\n[A.3.2] g[]() checks");
-        check_eq32("g[87654321](fedcba98)", g_ref(32'hfedcba98, 32'h87654321), 32'hfdcbc20c);
-        check_eq32("g[fdcbc20c](87654321)", g_ref(32'h87654321, 32'hfdcbc20c), 32'h7e791a4b);
-        check_eq32("g[7e791a4b](fdcbc20c)", g_ref(32'hfdcbc20c, 32'h7e791a4b), 32'hc76549ec);
-        check_eq32("g[c76549ec](7e791a4b)", g_ref(32'h7e791a4b, 32'hc76549ec), 32'h9791c849);
+        $display("---------------------------------------------------------");
+        $display(" GROUP 1: Encrypt (GOST A.3.4)");
+        $display(" Key K = ffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+        $display(" Plaintext a = fedcba9876543210");
+        $display(" Expected ciphertext b = 4ee901e5c2d8ca3d");
+        $display("---------------------------------------------------------");
+        $display("");
 
-        // ------------------------------------------------------------
-        // A.3.3: развёртка ключа (точечные проверки из таблицы)
-        // ------------------------------------------------------------
-        $display("\n[A.3.3] Key schedule checks (selected)");
-        check_eq32("K1 ",  rk_ref(K,  1), 32'hffeeddcc);
-        check_eq32("K2 ",  rk_ref(K,  2), 32'hbbaa9988);
-        check_eq32("K3 ",  rk_ref(K,  3), 32'h77665544);
-        check_eq32("K4 ",  rk_ref(K,  4), 32'h33221100);
-        check_eq32("K5 ",  rk_ref(K,  5), 32'hf0f1f2f3);
-        check_eq32("K8 ",  rk_ref(K,  8), 32'hfcfdfeff);
-        check_eq32("K9 (=K1)",   rk_ref(K,  9), 32'hffeeddcc);
-        check_eq32("K17(=K1)",   rk_ref(K, 17), 32'hffeeddcc);
-        check_eq32("K25(=K8)",   rk_ref(K, 25), 32'hfcfdfeff);
-        check_eq32("K32(=K1)",   rk_ref(K, 32), 32'hffeeddcc);
+        run_test(
+            "GOST A.3.4 - Encrypt: fedcba9876543210",
+            1'b0,
+            64'hfedcba9876543210,
+            256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff,
+            64'h4ee901e5c2d8ca3d
+        );
 
-        // ------------------------------------------------------------
-        // A.3.4: официальный вектор шифрования/дешифрования
-        // ------------------------------------------------------------
-        $display("\n[A.3.4] Official encrypt/decrypt vector");
-        PT = 64'hfedcba9876543210;
-        CT = 64'h4ee901e5c2d8ca3d;
+        $display("---------------------------------------------------------");
+        $display(" GROUP 2: Decrypt (GOST A.3.5)");
+        $display(" Ciphertext b = 4ee901e5c2d8ca3d");
+        $display(" Expected plaintext a = fedcba9876543210");
+        $display("---------------------------------------------------------");
+        $display("");
 
-        dut_encrypt(PT, K, got_ct);
-        check_eq64("Encrypt(PT)=CT", got_ct, CT);
+        run_test(
+            "GOST A.3.5 - Decrypt: 4ee901e5c2d8ca3d",
+            1'b1,
+            64'h4ee901e5c2d8ca3d,
+            256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff,
+            64'hfedcba9876543210
+        );
 
-        dut_decrypt(CT, K, got_pt);
-        check_eq64("Decrypt(CT)=PT", got_pt, PT);
+        $display("---------------------------------------------------------");
+        $display(" GROUP 3: Roundtrip Tests (Encrypt -> Decrypt)");
+        $display("---------------------------------------------------------");
+        $display("");
 
-        // ------------------------------------------------------------
-        // Итог
-        // ------------------------------------------------------------
-        $display("\n======================================================");
-        if (error_count == 0)
-            $display("                  ALL TESTS PASSED!");
-        else
-            $display("                  %0d TESTS FAILED!", error_count);
-        $display("======================================================\n");
+        run_roundtrip_test(
+            "GOST vector: fedcba9876543210",
+            64'hfedcba9876543210,
+            256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff
+        );
+
+        run_roundtrip_test(
+            "Zero plaintext",
+            64'h0000000000000000,
+            256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff
+        );
+
+        run_roundtrip_test(
+            "All-ones plaintext",
+            64'hffffffffffffffff,
+            256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff
+        );
+
+        run_roundtrip_test(
+            "Zero key",
+            64'hfedcba9876543210,
+            256'h0000000000000000000000000000000000000000000000000000000000000000
+        );
+
+        run_roundtrip_test(
+            "All-ones key",
+            64'hfedcba9876543210,
+            256'hffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+        );
+
+        run_roundtrip_test(
+            "Alternating pattern 0xAA plaintext",
+            64'haaaaaaaaaaaaaaaa,
+            256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff
+        );
+
+        run_roundtrip_test(
+            "Alternating pattern 0x55 key",
+            64'hfedcba9876543210,
+            256'h5555555555555555555555555555555555555555555555555555555555555555
+        );
+
+        run_roundtrip_test(
+            "One bit in plaintext (LSB)",
+            64'h0000000000000001,
+            256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff
+        );
+
+        run_roundtrip_test(
+            "One bit in plaintext (MSB)",
+            64'h8000000000000000,
+            256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff
+        );
+
+        run_roundtrip_test(
+            "Pseudorandom vector 1",
+            64'hdeadbeefcafebabe,
+            256'h0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+        );
+
+        run_roundtrip_test(
+            "Pseudorandom vector 2",
+            64'h0123456789abcdef,
+            256'hfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+        );
+
+        run_roundtrip_test(
+            "Zero key + zero block",
+            64'h0000000000000000,
+            256'h0000000000000000000000000000000000000000000000000000000000000000
+        );
+
+        $display("---------------------------------------------------------");
+        $display(" GROUP 4: Avalanche Effect Test");
+        $display("---------------------------------------------------------");
+        $display("");
+
+        begin
+            logic [63:0]  ct_orig, ct_flip_pt, ct_flip_key;
+            logic [255:0] test_key;
+            logic [63:0]  test_pt;
+            int           diff_bits_pt, diff_bits_key;
+
+            test_pt  = 64'hfedcba9876543210;
+            test_key = 256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff;
+
+            decrypt  = 1'b0;
+            block_in = test_pt;
+            key      = test_key;
+            #10;
+            ct_orig = block_out;
+
+            decrypt  = 1'b0;
+            block_in = test_pt ^ 64'h0000000000000001;
+            key      = test_key;
+            #10;
+            ct_flip_pt = block_out;
+
+            decrypt  = 1'b0;
+            block_in = test_pt;
+            key      = test_key ^ 256'h1;
+            #10;
+            ct_flip_key = block_out;
+
+            diff_bits_pt  = $countones(ct_orig ^ ct_flip_pt);
+            diff_bits_key = $countones(ct_orig ^ ct_flip_key);
+
+            total_tests++;
+            $display("[INFO] Avalanche - 1 bit change in PT:");
+            $display("       CT_original = 0x%016h", ct_orig);
+            $display("       CT_flipped  = 0x%016h", ct_flip_pt);
+            $display("       Bit difference = %0d / 64", diff_bits_pt);
+            if (diff_bits_pt >= 16) begin
+                $display("[PASS] Avalanche (1 bit PT change): %0d bits", diff_bits_pt);
+                passed_tests++;
+            end else begin
+                $display("[FAIL] Weak avalanche: only %0d bits changed", diff_bits_pt);
+                failed_tests++;
+            end
+            $display("");
+
+            total_tests++;
+            $display("[INFO] Avalanche - 1 bit change in KEY:");
+            $display("       CT_original = 0x%016h", ct_orig);
+            $display("       CT_flipped  = 0x%016h", ct_flip_key);
+            $display("       Bit difference = %0d / 64", diff_bits_key);
+            if (diff_bits_key >= 16) begin
+                $display("[PASS] Avalanche (1 bit KEY change): %0d bits", diff_bits_key);
+                passed_tests++;
+            end else begin
+                $display("[FAIL] Weak avalanche: only %0d bits changed", diff_bits_key);
+                failed_tests++;
+            end
+            $display("");
+        end
+
+        $display("---------------------------------------------------------");
+        $display(" GROUP 5: Additional Compatibility Tests");
+        $display("---------------------------------------------------------");
+        $display("");
+
+        begin
+            logic [63:0] ct_zero;
+            decrypt  = 1'b0;
+            block_in = 64'h0;
+            key      = 256'h0;
+            #10;
+            ct_zero = block_out;
+            total_tests++;
+            if (ct_zero !== 64'h0) begin
+                $display("[PASS] Encryption does not return zeros with zero inputs");
+                $display("       CT = 0x%016h", ct_zero);
+                passed_tests++;
+            end else begin
+                $display("[FAIL] Encryption returned zero result!");
+                failed_tests++;
+            end
+            $display("");
+        end
+
+        begin
+            logic [63:0] ct_enc, ct_dec;
+            logic [63:0] test_block;
+            logic [255:0] test_k;
+            test_block = 64'hfedcba9876543210;
+            test_k     = 256'hffeeddccbbaa99887766554433221100f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff;
+
+            decrypt  = 1'b0;
+            block_in = test_block;
+            key      = test_k;
+            #10;
+            ct_enc = block_out;
+
+            decrypt  = 1'b1;
+            block_in = test_block;
+            key      = test_k;
+            #10;
+            ct_dec = block_out;
+
+            total_tests++;
+            if (ct_enc !== ct_dec) begin
+                $display("[PASS] Encrypt and decrypt modes produce different results");
+                $display("       ENC(PT) = 0x%016h", ct_enc);
+                $display("       DEC(PT) = 0x%016h", ct_dec);
+                passed_tests++;
+            end else begin
+                $display("[FAIL] Encryption and decryption returned same result!");
+                failed_tests++;
+            end
+            $display("");
+        end
+
+        $display("=========================================================");
+        $display("  FINAL REPORT");
+        $display("=========================================================");
+        $display("  Total tests : %0d", total_tests);
+        $display("  Passed    : %0d", passed_tests);
+        $display("  Failed    : %0d", failed_tests);
+        $display("---------------------------------------------------------");
+
+        if (failed_tests == 0) begin
+            $display("  STATUS: ALL TESTS PASSED");
+            $display("  Implementation conforms to GOST 34.12-2018");
+        end else begin
+            $display("  STATUS: ERRORS DETECTED");
+            $display("  Implementation does NOT conform to GOST 34.12-2018");
+        end
+        $display("=========================================================");
 
         $finish;
+    end
+
+    // =========================================================
+    // Simulation Timeout
+    // =========================================================
+    initial begin
+        #100000;
+        $display("[ERROR] Simulation timeout!");
+        $finish;
+    end
+
+    // =========================================================
+    // VCD Dump for GTKWave / ModelSim
+    // =========================================================
+    initial begin
+        $dumpfile("magma_tb.vcd");
+        $dumpvars(0, magma_tb);
     end
 
 endmodule
